@@ -18,6 +18,11 @@ set_target_properties(
   PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
 )
 
+target_compile_definitions(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE MTGBINDER_PLUGIN_VERSION="${PROJECT_VERSION}"
+)
+
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
