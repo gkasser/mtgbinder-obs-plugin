@@ -9,12 +9,10 @@
 #include "stb_image_write.h"
 
 #include <QDialog>
-#include <QDesktopServices>
 #include <QFormLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
-#include <QUrl>
 #include <QVBoxLayout>
 
 #include <atomic>
@@ -34,7 +32,6 @@ namespace {
 
 constexpr const char *kConfigSection = "MTGBinderOBS";
 constexpr const char *kDefaultBaseUrl = "https://mtg-trade.fr";
-constexpr const char *kTwitchExtensionDashboardUrl = "https://dashboard.twitch.tv/extensions/lf7ae7n3jq5ibrb2kf3fjq5kqimu12-0.0.1";
 constexpr int kJpegQuality = 85;
 constexpr uint32_t kCaptureWidth = 1280;
 constexpr uint32_t kCaptureHeight = 720;
@@ -101,7 +98,23 @@ void loadConfig()
 	if (endpoint) gState.config.endpoint = endpoint;
 	gState.config.frameIntervalSecs = static_cast<int>(config_get_int(cfg, kConfigSection, "frame_interval_secs"));
 	if (gState.config.frameIntervalSecs <= 0) gState.config.frameIntervalSecs = 25;
-	gState.connected = !gState.token.empty() && !gState.config.channel.empty();
+	gState.connected = !gState.config.channel.empty();
+}
+
+void applyServerCadence(int intervalSecs, int retryAfterMs, int64_t ptsMs, bool accepted)
+{
+	if (intervalSecs > 0) {
+		std::lock_guard<std::mutex> lock(gState.configMutex);
+		gState.config.frameIntervalSecs = intervalSecs;
+	}
+	const int64_t now = epochMs();
+	int64_t target = accepted && intervalSecs > 0 ? ptsMs + static_cast<int64_t>(intervalSecs) * 1000 : now;
+	if (!accepted) {
+		const int waitMs = retryAfterMs > 0 ? retryAfterMs : (intervalSecs > 0 ? intervalSecs * 1000 : 1000);
+		target = now + waitMs;
+	}
+	const int64_t current = gState.nextCaptureMs.load();
+	if (target > current) gState.nextCaptureMs = target;
 }
 
 void appendJpegChunk(void *context, void *data, int size)
@@ -212,8 +225,15 @@ void uploadFrameAsync(uint64_t frameIndex, int64_t ptsMs, uint32_t width, uint32
 			}
 			const auto jpeg = encodeJpegFromBgra(bgra, width, height);
 			const auto result = MtgBinderClient(baseUrl).uploadFrame(config, token, frameIndex, ptsMs, width, height, jpeg);
-			if (!result.ok) {
+			const int interval = jsonIntValue(result.body, "frame_interval_secs", 0);
+			const int retryAfterMs = jsonIntValue(result.body, "retry_after_ms", 0);
+			if (interval > 0 || result.httpStatus == 429) {
+				applyServerCadence(interval, retryAfterMs, ptsMs, result.ok);
+			}
+			if (!result.ok && result.httpStatus != 429) {
 				blog(LOG_WARNING, "[mtgbinder] upload failed: HTTP %ld %s", result.httpStatus, result.body.c_str());
+			} else if (!result.ok) {
+				blog(LOG_INFO, "[mtgbinder] frame refused, next in %dms interval=%ds", retryAfterMs, interval);
 			} else {
 				blog(
 					LOG_INFO,
@@ -277,7 +297,7 @@ public:
 		layout->setSpacing(16);
 		layout->setContentsMargins(22, 22, 22, 22);
 
-		auto *title = new QLabel("Connect OBS to MTG Trade", this);
+		auto *title = new QLabel("MTG Binder OBS", this);
 		title->setStyleSheet("color: #f8fafc; font-size: 22px; font-weight: 800;");
 		layout->addWidget(title);
 
@@ -291,24 +311,18 @@ public:
 		baseUrl_ = new QLineEdit(this);
 		baseUrl_->setText(QString::fromStdString(gState.baseUrl));
 		form->addRow(siteLabel_, baseUrl_);
-		codeLabel_ = new QLabel("Twitch code", this);
+		codeLabel_ = new QLabel("Twitch channel", this);
 		linkCode_ = new QLineEdit(this);
-		linkCode_->setPlaceholderText("MTGB-XXXX-XXXX");
+		linkCode_->setPlaceholderText("channelname");
 		form->addRow(codeLabel_, linkCode_);
 		layout->addLayout(form);
 
-		openTwitchConfigButton_ = new QPushButton("Open Twitch extension config", this);
-		connectButton_ = new QPushButton("Connect plugin", this);
-		disconnectButton_ = new QPushButton("Disconnect", this);
-		openTwitchConfigButton_->setObjectName("secondaryButton");
+		connectButton_ = new QPushButton("Start capture", this);
+		disconnectButton_ = new QPushButton("Stop", this);
 		disconnectButton_->setObjectName("secondaryButton");
-		layout->addWidget(openTwitchConfigButton_);
 		layout->addWidget(connectButton_);
 		layout->addWidget(disconnectButton_);
 
-		QObject::connect(openTwitchConfigButton_, &QPushButton::clicked, []() {
-			QDesktopServices::openUrl(QUrl(kTwitchExtensionDashboardUrl));
-		});
 		QObject::connect(connectButton_, &QPushButton::clicked, [this]() { connectPlugin(); });
 		QObject::connect(disconnectButton_, &QPushButton::clicked, [this]() { disconnectPlugin(); });
 
@@ -329,14 +343,13 @@ private:
 				.arg(channel)
 				.arg(plan));
 		} else {
-			status_->setText("Generate a code in the Twitch extension configuration, paste it here, then connect the plugin.");
+			status_->setText("Enter your Twitch channel. The server accepts or rejects each frame and tells the plugin the allowed interval.");
 		}
 		const bool connected = gState.connected;
 		siteLabel_->setVisible(!connected);
 		baseUrl_->setVisible(!connected);
 		codeLabel_->setVisible(!connected);
 		linkCode_->setVisible(!connected);
-		openTwitchConfigButton_->setVisible(!connected);
 		connectButton_->setVisible(!connected);
 		disconnectButton_->setVisible(connected);
 	}
@@ -345,23 +358,22 @@ private:
 	{
 		try {
 			const std::string baseUrl = baseUrl_->text().toStdString();
-			const std::string code = linkCode_->text().trimmed().toStdString();
-			if (code.empty()) {
-				status_->setText("Paste the code generated from the Twitch extension configuration.");
+			std::string channel = linkCode_->text().trimmed().toLower().toStdString();
+			if (!channel.empty() && channel[0] == '@') channel.erase(channel.begin());
+			if (channel.size() < 3) {
+				status_->setText("Enter the Twitch channel name.");
 				return;
 			}
 			{
 				std::lock_guard<std::mutex> lock(gState.configMutex);
 				gState.baseUrl = baseUrl;
-			}
-			const auto response = MtgBinderClient(baseUrl).connectWithLinkCode(code, "OBS Studio");
-			{
-				std::lock_guard<std::mutex> lock(gState.configMutex);
-				gState.token = response.accessToken;
-				gState.config = response.config;
+				gState.token.clear();
+				gState.config.channel = channel;
+				gState.config.endpoint.clear();
+				if (gState.config.frameIntervalSecs <= 0) gState.config.frameIntervalSecs = 25;
 				gState.connected = true;
 			}
-			linkCode_->clear();
+			gState.nextCaptureMs = 0;
 			saveConfig();
 			refreshStatus();
 		} catch (const std::exception &e) {
@@ -386,7 +398,6 @@ private:
 	QLabel *codeLabel_ = nullptr;
 	QLineEdit *baseUrl_ = nullptr;
 	QLineEdit *linkCode_ = nullptr;
-	QPushButton *openTwitchConfigButton_ = nullptr;
 	QPushButton *connectButton_ = nullptr;
 	QPushButton *disconnectButton_ = nullptr;
 };

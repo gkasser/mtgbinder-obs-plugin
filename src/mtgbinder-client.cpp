@@ -160,12 +160,15 @@ UploadResult MtgBinderClient::uploadFrame(
 	const std::string pts = "x-obs-pts-ms: " + std::to_string(ptsMs);
 	const std::string sourceWidth = "x-obs-source-width: " + std::to_string(width);
 	const std::string sourceHeight = "x-obs-source-height: " + std::to_string(height);
-	headers = curl_slist_append(headers, auth.c_str());
+	if (!accessToken.empty()) headers = curl_slist_append(headers, auth.c_str());
 	headers = curl_slist_append(headers, "Content-Type: image/jpeg");
 	headers = curl_slist_append(headers, frame.c_str());
 	headers = curl_slist_append(headers, pts.c_str());
 	headers = curl_slist_append(headers, sourceWidth.c_str());
 	headers = curl_slist_append(headers, sourceHeight.c_str());
+
+	const std::string channelHeader = "x-obs-channel: " + config.channel;
+	headers = curl_slist_append(headers, channelHeader.c_str());
 
 	const std::string &endpoint = config.endpoint.empty() ? apiUrl("/api/obs/frames") : config.endpoint;
 	curl_easy_setopt(curl, CURLOPT_URL, endpoint.c_str());
