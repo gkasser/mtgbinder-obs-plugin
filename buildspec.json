@@ -38,7 +38,7 @@
     },
     "name": "mtgbinder-obs-plugin",
     "displayName": "MTG Trade OBS",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "author": "MTG Trade",
     "website": "https://mtg-trade.fr/twitch",
     "email": "gabriel.kasser@gmail.com"

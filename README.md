@@ -17,12 +17,28 @@ Download the archive for your OS from the
 
 ## Usage
 
-1. In OBS, open `Tools > MTG Binder OBS`.
-2. Enter the Twitch channel name and click `Start capture`.
+1. In OBS, connect your Twitch account: **Settings > Stream > Connect Account**.
+2. Install this plugin, then open **Tools > MTG Binder OBS**.
+3. Confirm the channel was detected from the connected Twitch account and that
+   capture started automatically.
+
+If you stream with a stream key only (no connected account), enter the Twitch
+channel name manually and click **Start capture**. The dialog shows whether the
+name came from the connected account or was entered manually.
+
+If you just clicked Connect Account and the channel is not detected yet, restart
+OBS once: OBS writes the account name to the profile on save, so it becomes
+visible to plugins after a restart (or a profile switch).
+
+The plugin never reads the stream key or OAuth tokens; it only uses the
+channel login name. Stopping capture is remembered so autodetection will not
+restart it until you click **Start capture** again.
 
 No link code. The first accepted frame creates the channel on the free plan if
 it does not exist yet. Each response carries `frame_interval_secs` (and
 `retry_after_ms` when the frame is refused) so the plugin follows the server cadence.
+
+Research notes for autodetection: [`docs/twitch-autodetect.md`](docs/twitch-autodetect.md).
 
 ## API contract
 
