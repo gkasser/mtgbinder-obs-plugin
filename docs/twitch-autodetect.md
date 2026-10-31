@@ -140,7 +140,7 @@ and follows a reconnect when OBS rebuilds the docks with a new login, even befor
 after that event; the plugin re-scans with a short `QTimer::singleShot` and a 7 s
 poll.
 
-## Method retained by this plugin
+## Method retained by this plugin (0.2.1)
 
 1. **Live (preferred when available):** parse Helix login from Twitch chat dock
    `urlChanged` URLs. Never read stream key or OAuth tokens.
@@ -156,9 +156,16 @@ poll.
    `OBS_FRONTEND_EVENT_STREAMING_STARTED`,
    deferred single-shot after load/profile change, plus a light UI-thread
    `QTimer` (7 s).
-5. Manual channel field remains for stream-key-only setups (no connected
+5. **Capture only while streaming** (auto and manual):
+   - start uploads on `OBS_FRONTEND_EVENT_STREAMING_STARTED` (and at plugin
+     load / `FINISHED_LOADING` when `obs_frontend_streaming_active()` is true);
+   - pause uploads on `OBS_FRONTEND_EVENT_STREAMING_STOPPED` and on
+     `OBS_FRONTEND_EVENT_EXIT` (armed channel is kept for the next go-live);
+   - a manual channel remains armed across stream ends unless the user clicks
+     Stop.
+6. Manual channel field remains for stream-key-only setups (no connected
    account / empty `Name` / no CEF docks).
-6. Explicit Stop is persisted in the plugin section so autodetection does not
+7. Explicit Stop is persisted in the plugin section so autodetection does not
    restart capture against the user's wish. Disconnect of a Twitch-sourced
    session stops capture without setting that flag, so a later reconnect can
    auto-start again.
