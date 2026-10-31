@@ -17,24 +17,25 @@ Download the archive for your OS from the
 
 ## Usage
 
-1. In OBS, connect your Twitch account: **Settings > Stream > Connect Account**.
+1. In OBS, connect your Twitch account: **Settings > Stream > Connect Account**,
+   then Apply.
 2. Install this plugin, then open **Tools > MTG Binder OBS**.
-3. Confirm the channel was detected from the connected Twitch account. Capture
-   starts automatically when you go live and stops when the stream ends.
+3. Confirm the channel was detected from the connected Twitch account (no
+   channel name to type). Capture starts automatically when you go live and
+   stops when the stream ends.
 
 If you stream with a stream key only (no connected account), enter the Twitch
 channel name manually and click **Start capture**. Uploads still run only while
 streaming. The dialog shows whether the name came from the connected account or
 was entered manually.
 
-If you just clicked Connect Account and the channel is not detected yet, restart
-OBS once: OBS writes the account name to the profile on save, so it becomes
-visible to plugins after a restart (or a profile switch). The plugin also
-re-reads the Twitch login at each stream start and when you change profile, so a
-rename done while OBS is open is picked up on the next go-live.
-
-The plugin never reads the stream key or OAuth tokens; it only uses the
-channel login name. Stopping capture is remembered so autodetection will not
+Detection uses the OBS profile login name (`Twitch` / `Name` in `basic.ini`) and,
+when Twitch browser docks are available, the live chat-panel URL after Connect or
+reconnect, so a new account is followed without waiting for an OBS restart. If
+docks are unavailable and you just clicked Connect Account, restart OBS once so
+the profile `Name` becomes visible. The plugin also re-reads the Twitch login at
+each stream start and when you change profile. The plugin never reads the stream
+key or OAuth tokens. Stopping capture is remembered so autodetection will not
 restart it until you click **Start capture** again.
 
 No link code. The first accepted frame creates the channel on the free plan if
