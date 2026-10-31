@@ -188,7 +188,8 @@ void loadConfig()
 	}
 	gState.userStopped = config_get_bool(cfg, kConfigSection, "user_stopped");
 	gState.channelFromTwitchAccount = config_get_bool(cfg, kConfigSection, "channel_from_twitch");
-	gState.connected = !gState.config.channel.empty() && !gState.userStopped;
+	/* Capture only while OBS is streaming; resume via STREAMING_STARTED / tryResumeArmedCapture. */
+	gState.connected = false;
 }
 
 void applyServerCadence(int intervalSecs, int retryAfterMs, int64_t ptsMs, bool accepted)
@@ -386,6 +387,7 @@ void onMainRender(void *, uint32_t, uint32_t)
 
 void startCaptureWithChannel(const std::string &channel, bool fromTwitchAccount)
 {
+	const bool live = obs_frontend_streaming_active();
 	{
 		std::lock_guard<std::mutex> lock(gState.configMutex);
 		gState.token.clear();
@@ -396,10 +398,30 @@ void startCaptureWithChannel(const std::string &channel, bool fromTwitchAccount)
 		}
 		gState.channelFromTwitchAccount = fromTwitchAccount;
 		gState.userStopped = false;
-		gState.connected = true;
+		/* Frames are uploaded only while a stream is active. */
+		gState.connected = live;
 	}
 	gState.nextCaptureMs = 0;
 	saveConfig();
+	if (live) {
+		blog(LOG_INFO, "[mtgbinder] capture started for channel %s", channel.c_str());
+	} else {
+		blog(LOG_INFO, "[mtgbinder] channel %s armed; capture waits for stream start", channel.c_str());
+	}
+}
+
+/* End of stream / OBS exit: stop uploads but keep the armed channel for the next go-live. */
+void pauseCapture()
+{
+	bool wasConnected = false;
+	{
+		std::lock_guard<std::mutex> lock(gState.configMutex);
+		wasConnected = gState.connected;
+		gState.connected = false;
+	}
+	if (wasConnected) {
+		blog(LOG_INFO, "[mtgbinder] capture paused (stream stopped)");
+	}
 }
 
 void stopCapture(bool userInitiated)
@@ -533,38 +555,49 @@ private:
 		std::string plan;
 		bool fromTwitch = false;
 		bool connected = false;
+		bool userStopped = false;
 		{
 			std::lock_guard<std::mutex> lock(gState.configMutex);
 			channel = gState.config.channel;
 			plan = gState.config.plan;
 			fromTwitch = gState.channelFromTwitchAccount;
 			connected = gState.connected;
+			userStopped = gState.userStopped;
 		}
 
 		const QString channelQt = QString::fromStdString(channel).toHtmlEscaped();
 		updateSourceLabel(fromTwitch, QString::fromStdString(channel));
 
+		const bool armed = !channel.empty() && !userStopped;
 		if (connected) {
 			const QString planQt = QString::fromStdString(plan).toUpper().toHtmlEscaped();
 			status_->setText(QString(
-				"<div style='color:#94a3b8; font-size:13px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase;'>Connected to channel</div>"
+				"<div style='color:#94a3b8; font-size:13px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase;'>Capturing channel</div>"
 				"<div style='color:#f8fafc; font-size:28px; font-weight:900; margin-top:6px;'>%1</div>"
-				"<div style='color:#cbd5e1; font-size:13px; margin-top:8px;'>Tier %2</div>"
+				"<div style='color:#cbd5e1; font-size:13px; margin-top:8px;'>Tier %2 — uploads only while streaming</div>"
 			)
 						     .arg(channelQt)
 						     .arg(planQt));
+		} else if (armed) {
+			status_->setText(QString(
+				"<div style='color:#94a3b8; font-size:13px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase;'>Ready</div>"
+				"<div style='color:#f8fafc; font-size:28px; font-weight:900; margin-top:6px;'>%1</div>"
+				"<div style='color:#cbd5e1; font-size:13px; margin-top:8px;'>Capture starts automatically when you go live.</div>"
+			)
+						     .arg(channelQt));
 		} else {
 			status_->setText(
 				"Connect your Twitch account in OBS (Settings > Stream > Connect Account) for autodetection, or enter the channel name manually."
 			);
 		}
 
-		siteLabel_->setVisible(!connected);
-		baseUrl_->setVisible(!connected);
-		codeLabel_->setVisible(!connected);
-		linkCode_->setVisible(!connected);
-		connectButton_->setVisible(!connected);
-		disconnectButton_->setVisible(connected);
+		const bool showForm = !connected && !armed;
+		siteLabel_->setVisible(showForm);
+		baseUrl_->setVisible(showForm);
+		codeLabel_->setVisible(showForm);
+		linkCode_->setVisible(showForm);
+		connectButton_->setVisible(showForm);
+		disconnectButton_->setVisible(connected || armed);
 	}
 
 	void connectPlugin()
@@ -614,6 +647,33 @@ void notifyOpenDialog()
 	}
 }
 
+/* Resume a previously armed (auto or manual) channel when streaming becomes active. */
+void tryResumeArmedCapture()
+{
+	if (!obs_frontend_streaming_active()) {
+		return;
+	}
+
+	std::string channel;
+	bool fromTwitch = false;
+	bool userStopped = false;
+	bool connected = false;
+	{
+		std::lock_guard<std::mutex> lock(gState.configMutex);
+		channel = gState.config.channel;
+		fromTwitch = gState.channelFromTwitchAccount;
+		userStopped = gState.userStopped;
+		connected = gState.connected;
+	}
+
+	if (connected || userStopped || channel.empty()) {
+		return;
+	}
+
+	startCaptureWithChannel(channel, fromTwitch);
+	notifyOpenDialog();
+}
+
 void applyTwitchAutodetect()
 {
 	const std::string detected = detectTwitchChannelFromObs();
@@ -653,10 +713,11 @@ void applyTwitchAutodetect()
 		return;
 	}
 
-	if (currentChannel != detected || !connected) {
+	if (currentChannel != detected) {
 		if (!userStopped) {
+			/* Follow rename: updates armed channel; uploads only if live. */
 			startCaptureWithChannel(detected, true);
-		} else if (currentChannel != detected) {
+		} else {
 			{
 				std::lock_guard<std::mutex> lock(gState.configMutex);
 				gState.config.channel = detected;
@@ -664,6 +725,8 @@ void applyTwitchAutodetect()
 			}
 			saveConfig();
 		}
+	} else if (!connected && !userStopped && obs_frontend_streaming_active()) {
+		startCaptureWithChannel(detected, true);
 	}
 
 	notifyOpenDialog();
@@ -688,17 +751,32 @@ void onFrontendEvent(enum obs_frontend_event event, void *)
 	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
 		loadConfig();
 		ensureTwitchPollTimer();
+		/* Re-read Auth/Type + Twitch/Name; start only if already live. */
 		applyTwitchAutodetect();
+		tryResumeArmedCapture();
 		break;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
 		loadConfig();
+		/* Profile switch: re-read basic.ini Twitch login and follow rename. */
 		applyTwitchAutodetect();
+		tryResumeArmedCapture();
+		notifyOpenDialog();
 		break;
 	case OBS_FRONTEND_EVENT_STREAMING_STARTING:
-	case OBS_FRONTEND_EVENT_STREAMING_STARTED:
+		/* Early re-read of Auth/Type + Twitch/Name before go-live. */
 		applyTwitchAutodetect();
 		break;
+	case OBS_FRONTEND_EVENT_STREAMING_STARTED:
+		/* Re-read channel (rename while OBS was open) then start capture. */
+		applyTwitchAutodetect();
+		tryResumeArmedCapture();
+		break;
+	case OBS_FRONTEND_EVENT_STREAMING_STOPPED:
+		pauseCapture();
+		notifyOpenDialog();
+		break;
 	case OBS_FRONTEND_EVENT_EXIT:
+		pauseCapture();
 		if (gTwitchPollTimer) {
 			gTwitchPollTimer->stop();
 			gTwitchPollTimer->deleteLater();
@@ -731,14 +809,15 @@ bool obs_module_load(void)
 	loadConfig();
 	obs_add_main_render_callback(onMainRender, nullptr);
 	obs_frontend_add_event_callback(onFrontendEvent, nullptr);
-	obs_frontend_add_tools_menu_item("MTG Binder OBS", openConnectDialog, nullptr);
-	blog(LOG_INFO, "[mtgbinder] plugin loaded");
+	obs_frontend_add_tools_menu_item(obs_module_text("ToolsMenu.MTGBinderOBS"), openConnectDialog, nullptr);
+	blog(LOG_INFO, "[mtgbinder] plugin loaded (capture only while streaming)");
 	return true;
 }
 
 void obs_module_unload(void)
 {
 	obs_frontend_remove_event_callback(onFrontendEvent, nullptr);
+	pauseCapture();
 	if (gTwitchPollTimer) {
 		gTwitchPollTimer->stop();
 		gTwitchPollTimer->deleteLater();

@@ -125,22 +125,30 @@ API declarations: `frontend/api/obs-frontend-api.h` (`obs_frontend_get_profile_c
 | Apply stream settings | `SaveStream1Settings` (~`267`) | Sets `main->auth`, saves `service.json` including `key` |
 | Auth type + Twitch `Name` flush | `Auth::Save()` | On profile switch / process save paths (see caveats) |
 
-## Method retained by this plugin
+## Method retained by this plugin (0.2.1)
 
 1. Primary: `obs_frontend_get_profile_config()` → require `Auth`/`Type` ==
    `"Twitch"` → read only `Twitch`/`Name` → normalize (trim, lower case, strip
    leading `@`).
 2. Optional confirmation: `obs_frontend_get_streaming_service()` + settings
    field `"service"` only (must be `"Twitch"` when present); never `"key"`.
-3. Refresh on `OBS_FRONTEND_EVENT_FINISHED_LOADING`,
-   `OBS_FRONTEND_EVENT_PROFILE_CHANGED`,
-   `OBS_FRONTEND_EVENT_STREAMING_STARTING` /
-   `OBS_FRONTEND_EVENT_STREAMING_STARTED`
-   (`frontend/api/obs-frontend-api.h` `17`, `32`, `46`), plus a light UI-thread
-   `QTimer` (5-10 s).
-4. Manual channel field remains for stream-key-only setups (no connected
+3. **Re-read `Auth`/`Type` + `Twitch`/`Name` on every stream start and profile
+   change** so a channel rename (or account switch) done while OBS stays open is
+   picked up:
+   - `OBS_FRONTEND_EVENT_STREAMING_STARTING` / `STREAMING_STARTED`
+   - `OBS_FRONTEND_EVENT_PROFILE_CHANGED`
+   - also `FINISHED_LOADING`, plus a light UI-thread `QTimer` (5-10 s)
+   (`frontend/api/obs-frontend-api.h`).
+4. **Capture only while streaming** (auto and manual):
+   - start uploads on `OBS_FRONTEND_EVENT_STREAMING_STARTED` (and at plugin
+     load / `FINISHED_LOADING` when `obs_frontend_streaming_active()` is true);
+   - pause uploads on `OBS_FRONTEND_EVENT_STREAMING_STOPPED` and on
+     `OBS_FRONTEND_EVENT_EXIT` (armed channel is kept for the next go-live);
+   - a manual channel remains armed across stream ends unless the user clicks
+     Stop.
+5. Manual channel field remains for stream-key-only setups (no connected
    account / empty `Name`).
-5. Explicit Stop is persisted in the plugin section so autodetection does not
+6. Explicit Stop is persisted in the plugin section so autodetection does not
    restart capture against the user's wish.
 
 ## Caveats / open points
