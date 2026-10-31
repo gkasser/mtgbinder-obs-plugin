@@ -1,4 +1,5 @@
 #include "mtgbinder-client.hpp"
+#include "twitch-url-sink.hpp"
 
 #include <curl/curl.h>
 #include <obs-frontend-api.h>
@@ -9,12 +10,15 @@
 #include "stb_image_write.h"
 
 #include <QDialog>
+#include <QDockWidget>
 #include <QFormLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMainWindow>
 #include <QPointer>
 #include <QPushButton>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #include <atomic>
@@ -56,6 +60,10 @@ struct RuntimeState {
 	/* True when the active channel came from OBS Twitch account Name. */
 	bool channelFromTwitchAccount = false;
 	std::string lastDetectedChannel;
+	/* Live login parsed from the Twitch chat dock URL (QCefWidget::urlChanged). */
+	std::string livePanelChannel;
+	bool twitchPanelPresent = false;
+	bool twitchPanelEverSeen = false;
 
 	gs_texrender_t *texrender = nullptr;
 	gs_stagesurf_t *stage = nullptr;
@@ -65,8 +73,12 @@ struct RuntimeState {
 
 RuntimeState gState;
 QPointer<QTimer> gTwitchPollTimer;
+QPointer<TwitchUrlSink> gTwitchUrlSink;
 class ConnectDialog;
 QPointer<ConnectDialog> gOpenDialog;
+
+void applyTwitchAutodetect();
+void attachTwitchPanelWatchers();
 
 int64_t epochMs()
 {
@@ -93,9 +105,146 @@ std::string normalizeChannelName(std::string channel)
 	return channel;
 }
 
-/* Reads only Auth/Type and Twitch/Name. Never Token, RefreshToken, ExpireTime, or service key. */
+/* OBS TwitchAuth builds panel URLs with the Helix login (TwitchAuth.cpp LoadUI). Never tokens. */
+std::string channelFromTwitchPanelUrl(const QString &urlText)
+{
+	const QUrl url(urlText);
+	if (!url.isValid()) {
+		return {};
+	}
+	const QString host = url.host().toLower();
+	const QString path = url.path();
+	const QStringList parts = path.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+	if (parts.isEmpty()) {
+		return {};
+	}
+
+	QString login;
+	if (host == QLatin1String("www.twitch.tv") || host == QLatin1String("twitch.tv")) {
+		/* /popout/<login>/chat or /popout/<login>/dashboard/live/stats */
+		if (parts.size() >= 2 && parts.at(0).compare(QLatin1String("popout"), Qt::CaseInsensitive) == 0) {
+			login = parts.at(1);
+		}
+	} else if (host == QLatin1String("dashboard.twitch.tv")) {
+		/* /popout/u/<login>/stream-manager/... */
+		if (parts.size() >= 3 && parts.at(0).compare(QLatin1String("popout"), Qt::CaseInsensitive) == 0 &&
+		    parts.at(1).compare(QLatin1String("u"), Qt::CaseInsensitive) == 0) {
+			login = parts.at(2);
+		}
+	}
+
+	if (login.isEmpty() || login.compare(QLatin1String("popout"), Qt::CaseInsensitive) == 0 ||
+	    login.compare(QLatin1String("u"), Qt::CaseInsensitive) == 0) {
+		return {};
+	}
+	return normalizeChannelName(login.toStdString());
+}
+
+bool streamingServiceLooksLikeTwitch()
+{
+	obs_service_t *service = obs_frontend_get_streaming_service();
+	if (!service) {
+		return true;
+	}
+	obs_data_t *settings = obs_service_get_settings(service);
+	if (!settings) {
+		return true;
+	}
+	const char *serviceName = obs_data_get_string(settings, "service");
+	/* Only the "service" field; never read "key". */
+	const bool ok = !serviceName || !*serviceName || std::strcmp(serviceName, "Twitch") == 0;
+	obs_data_release(settings);
+	return ok;
+}
+
+void onLiveTwitchPanelUrl(const QString &url)
+{
+	const std::string channel = channelFromTwitchPanelUrl(url);
+	if (channel.empty()) {
+		return;
+	}
+	bool changed = false;
+	{
+		std::lock_guard<std::mutex> lock(gState.configMutex);
+		changed = gState.livePanelChannel != channel;
+		gState.livePanelChannel = channel;
+		gState.twitchPanelPresent = true;
+		gState.twitchPanelEverSeen = true;
+	}
+	if (changed) {
+		blog(LOG_INFO, "[mtgbinder] Twitch panel channel: %s", channel.c_str());
+		applyTwitchAutodetect();
+	}
+}
+
+void attachTwitchPanelWatchers()
+{
+	auto *mainWindow = qobject_cast<QMainWindow *>(static_cast<QWidget *>(obs_frontend_get_main_window()));
+	if (!mainWindow) {
+		return;
+	}
+
+	if (!gTwitchUrlSink) {
+		auto *sink = new TwitchUrlSink(mainWindow);
+		sink->setHandler([](const QString &url) { onLiveTwitchPanelUrl(url); });
+		gTwitchUrlSink = sink;
+	}
+
+	QDockWidget *chatDock = mainWindow->findChild<QDockWidget *>(QStringLiteral("twitchChat"));
+	{
+		std::lock_guard<std::mutex> lock(gState.configMutex);
+		if (chatDock) {
+			gState.twitchPanelPresent = true;
+			gState.twitchPanelEverSeen = true;
+		} else {
+			gState.twitchPanelPresent = false;
+			gState.livePanelChannel.clear();
+		}
+	}
+	if (!chatDock) {
+		return;
+	}
+
+	const auto widgets = chatDock->findChildren<QWidget *>();
+	for (QWidget *widget : widgets) {
+		if (!widget || widget->property("mtgbinderUrlWatch").toBool()) {
+			continue;
+		}
+		const QMetaObject *meta = widget->metaObject();
+		if (meta->indexOfSignal("urlChanged(QString)") < 0) {
+			continue;
+		}
+		widget->setProperty("mtgbinderUrlWatch", true);
+		QObject::connect(widget, SIGNAL(urlChanged(QString)), gTwitchUrlSink, SLOT(onUrlChanged(QString)));
+	}
+}
+
+/* Prefer live dock URL (fresh after Connect / reconnect). Else Auth/Type + Twitch/Name.
+ * Never Token, RefreshToken, ExpireTime, or service key. */
 std::string detectTwitchChannelFromObs()
 {
+	attachTwitchPanelWatchers();
+
+	std::string live;
+	bool panelEverSeen = false;
+	bool panelPresent = false;
+	{
+		std::lock_guard<std::mutex> lock(gState.configMutex);
+		live = gState.livePanelChannel;
+		panelEverSeen = gState.twitchPanelEverSeen;
+		panelPresent = gState.twitchPanelPresent;
+	}
+
+	if (!live.empty() && streamingServiceLooksLikeTwitch()) {
+		return live;
+	}
+
+	/* After the Twitch docks were torn down, profile Twitch/Name can stay stale until
+	 * Auth::Save (exit or profile switch). Do not keep using it. */
+	if (panelEverSeen && !panelPresent) {
+		return {};
+	}
+
 	config_t *cfg = obs_frontend_get_profile_config();
 	if (!cfg) {
 		return {};
@@ -111,18 +260,8 @@ std::string detectTwitchChannelFromObs()
 		return {};
 	}
 
-	obs_service_t *service = obs_frontend_get_streaming_service();
-	if (service) {
-		obs_data_t *settings = obs_service_get_settings(service);
-		if (settings) {
-			const char *serviceName = obs_data_get_string(settings, "service");
-			/* Only the "service" field; never read "key". Reject a non-Twitch platform name. */
-			const bool reject = serviceName && *serviceName && std::strcmp(serviceName, "Twitch") != 0;
-			obs_data_release(settings);
-			if (reject) {
-				return {};
-			}
-		}
+	if (!streamingServiceLooksLikeTwitch()) {
+		return {};
 	}
 
 	return normalizeChannelName(name);
@@ -641,6 +780,10 @@ void applyTwitchAutodetect()
 	}
 
 	if (detected.empty()) {
+		/* Account disconnected / docks gone: stop only when we were following Twitch auth. */
+		if (fromTwitch && connected) {
+			stopCapture(false);
+		}
 		notifyOpenDialog();
 		return;
 	}
@@ -677,7 +820,10 @@ void ensureTwitchPollTimer()
 	QWidget *mainWindow = static_cast<QWidget *>(obs_frontend_get_main_window());
 	auto *timer = new QTimer(mainWindow);
 	timer->setInterval(kTwitchPollIntervalMs);
-	QObject::connect(timer, &QTimer::timeout, []() { applyTwitchAutodetect(); });
+	QObject::connect(timer, &QTimer::timeout, []() {
+		attachTwitchPanelWatchers();
+		applyTwitchAutodetect();
+	});
 	timer->start();
 	gTwitchPollTimer = timer;
 }
@@ -689,13 +835,29 @@ void onFrontendEvent(enum obs_frontend_event event, void *)
 		loadConfig();
 		ensureTwitchPollTimer();
 		applyTwitchAutodetect();
+		/* Auth::Load() runs after FINISHED_LOADING and creates Twitch docks then. */
+		QTimer::singleShot(800, []() {
+			attachTwitchPanelWatchers();
+			applyTwitchAutodetect();
+		});
 		break;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
+		{
+			std::lock_guard<std::mutex> lock(gState.configMutex);
+			gState.livePanelChannel.clear();
+			gState.twitchPanelPresent = false;
+			gState.twitchPanelEverSeen = false;
+		}
 		loadConfig();
 		applyTwitchAutodetect();
+		QTimer::singleShot(800, []() {
+			attachTwitchPanelWatchers();
+			applyTwitchAutodetect();
+		});
 		break;
 	case OBS_FRONTEND_EVENT_STREAMING_STARTING:
 	case OBS_FRONTEND_EVENT_STREAMING_STARTED:
+		attachTwitchPanelWatchers();
 		applyTwitchAutodetect();
 		break;
 	case OBS_FRONTEND_EVENT_EXIT:
